@@ -11,14 +11,21 @@ from breadth_first_search import breadth_first_search
 class Database(object):
   """Wrapper for connecting to the SDOW database."""
 
-  def __init__(self, sqlite_filename):
-    if not os.path.isfile(sqlite_filename):
-      raise IOError('Specified SQLite file "{0}" does not exist.'.format(sqlite_filename))
+  def __init__(self, sdow_database, searches_database):
+    if not os.path.isfile(sdow_database):
+      raise IOError('Specified SQLite file "{0}" does not exist.'.format(sdow_database))
 
-    self.conn = sqlite3.connect(sqlite_filename)
-    self.cursor = self.conn.cursor()
+    if not os.path.isfile(searches_database):
+      raise IOError('Specified SQLite file "{0}" does not exist.'.format(searches_database))
 
-    self.cursor.arraysize = 1000
+    self.sdow_conn = sqlite3.connect(sdow_database)
+    self.searches_conn = sqlite3.connect(searches_database)
+
+    self.sdow_cursor = self.sdow_conn.cursor()
+    self.searches_cursor = self.searches_conn.cursor()
+
+    self.sdow_cursor.arraysize = 1000
+    self.searches_cursor.arraysize = 1000
 
   def fetch_page(self, page_title):
     """Returns the ID and title of the non-redirect page corresponding to the provided title,
@@ -40,11 +47,11 @@ class Database(object):
 
     query = 'SELECT * FROM pages WHERE title = ? COLLATE NOCASE;'
     query_bindings = (sanitized_page_title,)
-    self.cursor.execute(query, query_bindings)
+    self.sdow_cursor.execute(query, query_bindings)
 
     # Because the above query is case-insensitive (due to the COLLATE NOCASE), multiple articles
     # can be matched.
-    results = self.cursor.fetchall()
+    results = self.sdow_cursor.fetchall()
 
     if not results:
       raise ValueError(
@@ -63,9 +70,15 @@ class Database(object):
     # If all the results are redirects, use the page to which the first result redirects.
     query = 'SELECT target_id, title FROM redirects INNER JOIN pages ON pages.id = target_id WHERE source_id = ?;'
     query_bindings = (results[0][0],)
-    self.cursor.execute(query, query_bindings)
+    self.sdow_cursor.execute(query, query_bindings)
 
-    result = self.cursor.fetchone()
+    result = self.sdow_cursor.fetchone()
+
+    # TODO: This will no longer be required once the April 2018 database dump occurs since this
+    # scenario is prevented by the prune_pages_file.py Python script during the database creation.
+    if not result:
+      raise ValueError(
+          'Invalid page title {0} provided. Page title does not exist.'.format(page_title))
 
     return (result[0], helpers.get_readable_page_title(result[1]), True)
 
@@ -85,9 +98,9 @@ class Database(object):
 
     query = 'SELECT title FROM pages WHERE id = ?;'
     query_bindings = (page_id,)
-    self.cursor.execute(query, query_bindings)
+    self.sdow_cursor.execute(query, query_bindings)
 
-    page_title = self.cursor.fetchone()
+    page_title = self.sdow_cursor.fetchone()
 
     if not page_title:
       raise ValueError(
@@ -116,6 +129,46 @@ class Database(object):
     helpers.validate_page_id(target_page_id)
 
     return breadth_first_search(source_page_id, target_page_id, self)
+
+  def fetch_outgoing_links_count(self, page_ids):
+    """Returns the sum of outgoing links of the provided page IDs.
+
+    Args:
+      page_ids: A list of page IDs whose outgoing links to count.
+
+    Returns:
+      int: The count of outgoing links.
+    """
+    return self.fetch_links_count_helper(page_ids, 'outgoing_links_count')
+
+  def fetch_incoming_links_count(self, page_ids):
+    """Returns the sum of incoming links for the provided page IDs.
+
+    Args:
+      page_ids: A list of page IDs whose incoming links to count.
+
+    Returns:
+      int: The count of incoming links.
+    """
+    return self.fetch_links_count_helper(page_ids, 'incoming_links_count')
+
+  def fetch_links_count_helper(self, page_ids, incoming_or_outgoing_links_count):
+    """Returns the sum of outgoing or incoming links for the provided page IDs.
+
+    Args:
+      page_ids: A list of page IDs whose outgoing or incoming links to count.
+
+    Returns:
+      int: The count of outgoing or incoming links.
+    """
+    page_ids = str(tuple(page_ids)).replace(',)', ')')
+
+    # There is no need to escape the query parameters here since they are never user-defined.
+    query = 'SELECT SUM({0}) FROM links WHERE id IN {1};'.format(
+        incoming_or_outgoing_links_count, page_ids)
+    self.sdow_cursor.execute(query)
+
+    return self.sdow_cursor.fetchone()[0]
 
   def fetch_outgoing_links(self, page_ids):
     """Returns a list of tuples of page IDs representing outgoing links from the list of provided
@@ -164,9 +217,9 @@ class Database(object):
     # There is no need to escape the query parameters here since they are never user-defined.
     query = 'SELECT id, {0} FROM links WHERE id IN {1};'.format(
         outcoming_or_incoming_links, page_ids)
-    self.cursor.execute(query)
+    self.sdow_cursor.execute(query)
 
-    return self.cursor
+    return self.sdow_cursor
 
   def insert_result(self, search):
     """Inserts a new search result into the searches table.
@@ -181,19 +234,16 @@ class Database(object):
 
     if paths_count == 0:
       degrees_count = 'NULL'
-      paths = str([])
     else:
       degrees_count = len(search['paths'][0]) - 1
-      paths = str(search['paths']).replace(' ', '')
 
     # There is no need to escape the query parameters here since they are never user-defined.
-    query = 'INSERT INTO searches VALUES ({source_id}, {target_id}, {duration}, {degrees_count}, {paths_count}, "{paths}", CURRENT_TIMESTAMP);'.format(
+    query = 'INSERT INTO searches VALUES ({source_id}, {target_id}, {duration}, {degrees_count}, {paths_count}, CURRENT_TIMESTAMP);'.format(
         source_id=search['source_id'],
         target_id=search['target_id'],
         duration=search['duration'],
         degrees_count=degrees_count,
         paths_count=paths_count,
-        paths=paths
     )
-    self.conn.execute(query)
-    self.conn.commit()
+    self.searches_conn.execute(query)
+    self.searches_conn.commit()
